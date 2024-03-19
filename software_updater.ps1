@@ -29,12 +29,13 @@ $lanman_ws_path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Par
 $lanman_srv_path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
 $root_installer_path = "C:\Downloaded Software"
 $root_installer_path_2 = "C:\packages"
-# full list of installed apps, as pulled from the registry
+# full list of installed apps, as pulled from the registry.
+# first we'll get the 32-bit app list, followed by 64-bit app list.
+# then, we'll get the apps installed in the Appx format (.msix), and concat them to the $all_apps array.
 $all_apps = @()
-# get 32-bit app list, followed by 64-bit app list, then the apps installed in the Appx format (.msix), and concat them to the $all_apps array
 $all_apps += Get-ItemProperty "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" | Select-Object -Property DisplayName, DisplayVersion
 $all_apps += Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | Select-Object -Property DisplayName, DisplayVersion
-$all_apps += Get-AppxPackage -AllUsers | Where-Object {$_.Name -eq "MSTeams"} | Select-Object -Property Name, Version
+$all_apps += Get-AppxPackage -AllUsers | Select-Object -Property Name, Version
 
 # now match the required apps list against the installed applications on the local machine
 $found_apps = $all_apps | Where-Object { $required_application_list -contains $_.displayname }
@@ -64,13 +65,13 @@ function compare_versions {
         # otherwise, if they're equal, continue iterating through the components
         } elseif ($c1 -eq $c2) {
             continue
-        # if has > needs, then the rest doesnt matter, you're on a newer version than what's required
+        # if has > needs, then the rest doesnt matter; you're on a newer version than what's required
         } elseif ($c1 -gt $c2) {
             return 0
         }
     }
 
-    # versions are equal if all components match
+    # if versions are equal, then we can also return 0; we won't need to update
     return 0
 }
 
@@ -78,7 +79,8 @@ function compare_versions {
 function check_for_updates {
     foreach ($app in $required_app_versions.Keys) {
 
-        # currently, "new teams" is the only msix app that is being installed on machines regularly, so we check for that and get the version accordingly
+        # currently, "new teams" is the only msix app that is being installed on our machines regularly, so i'm choosing to explicitly check for that and get the current version.
+        # later on, we can easily change this to match $app against any apps in the $msix_apps object.
         if ($app -eq "MSTeams") {
             $current_app_version = ($msix_apps | Where-Object { $_.Name -eq $app } | Select-Object -Property Version -First 1).version
         # otherwise, enumerate the current version of the current app in the typical way
@@ -96,12 +98,13 @@ function check_for_updates {
                 write-host "google chrome needs to be updated! open the browser and trigger an update."
                 continue
             }
-            # this branch will be for installers that are located in the landesk\packages share
+            # this branch will be for installers that are located in the 'packages' share.
+            # again, there are only 2 so i'm choosing to check explicitly rather than match against some data structure. can be changed at a later date.
             if ($app -eq "MSTeams" -or $app -eq "UniversalForwarder") {
                 & "$($root_installer_path_2)\$($app_installers[$app])"
                 continue
             }
-            
+            # TODO: display "none" if $current_app_verison is null/empty
             write-host $app, "has", "v$current_app_version;", "needs", "v$($required_app_versions[$app])."
             write-host "$app needs to be updated; updating now."
             # update app using default installer path ("Downloaded Software" shared folder)
