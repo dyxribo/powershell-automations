@@ -24,7 +24,7 @@ if ($targetuser) {
     $TARGET_USER = Read-Host "enter the target username for the Chrome profile copy"
 }
 
-# Define the path to the Chrome profile of the specified user
+# check the current user's appdata folder for a chrome profile
 $CHROME_PROFILE_PATH = "C:\Users\$TARGET_USER\AppData\Local\Google\Chrome\User Data"
 
 if (-not (Test-Path -Path $CHROME_PROFILE_PATH)) {
@@ -39,7 +39,7 @@ $output_zip_name = "$TARGET_USER.chromecopy.$date.zip"
 # temp location for the zipped file
 $temp_zip_path = Join-Path -Path $env:TEMP -ChildPath $output_zip_name
 
-# compress the entire Chrome profile folder
+# compress the entire chrome profile folder
 
 Get-Process "chrome" -ErrorAction SilentlyContinue | ForEach-Object {
     write-host "closing google chrome..."
@@ -70,7 +70,7 @@ try {
     return "exit code: ${ERROR_ZIP_FAIL}"
 }
 
-# current user's desktop; should try to change this to a share folder
+
 $desktop_path = "\\cs-it01\Software\chrome_profiles"
 $destination_zip_path = Join-Path -Path $desktop_path -ChildPath $output_zip_name
 
