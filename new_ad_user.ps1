@@ -1,605 +1,400 @@
-﻿<#
+<#!
 .SYNOPSIS
-  this script clones the “basicuser” template object with full validation,
-  mandatory HR metadata, on-prem & Azure groups, licenses, etc.
+    Clone the **basicuser** template and fully provision or update an AD/Azure AD user.
+    Compatible with **PowerShell 5.1**.
 
 .EXAMPLE
-  .\new_ad_user.ps1 -username klamar `
-                     -givenname Kendrick `
-                     -surname Lamar `
-                     -jobtitle "The Boogeyman" `
-                     -department "Graphics" `
-                     -hiredate 2025.02.09 ` # yyyy.mm.dd
-                     -company "Composecure" `
-                     -manager rkopacz `
-                     -office Pierce `
-                     -addgroups 'Graphics','ZScaler ZIA' `
-                     -addazuregroups 'ZScaler Conditional Access' `
-                     -primarycompany composecure `
-                     -employeeid 1324 `
-                     -extension 1234 `
-                     -license E3 `
-                     -extraattr @{mailNickname='john.doe';attr2='something.else'}
+    .\new_ad_user.ps1 -username klamar \
+                      -givenname Kendrick \
+                      -surname Lamar \
+                      -jobtitle "The Boogeyman" \
+                      -department Graphics \
+                      -hiredate 2025.02.09 \
+                      -company composecure \
+                      -manager rkopacz \
+                      -office Pierce \
+                      -addgroups Graphics,'ZScaler ZIA' \
+                      -addazuregroups 'ZScaler Conditional Access' \
+                      -primarycompany composecure \
+                      -employeeid 1324 \
+                      -extension 1234 \
+                      -license E3 \
+                      -extraattr @{mailNickname='john.doe'}
 #>
 
 param(
-    # ── identity ─────────────────────────────────────────────
+    # ── identity ───────────────────────────────────────────
     [string]$username,
     [string]$givenname,
     [string]$surname,
 
-    # ── mandatory HR data ───────────────────────────────────
+    # ── mandatory HR data ─────────────────────────────────
     [string]$jobtitle,
     [string]$department,
-    [ValidatePattern('^(\d{8}|^$)$')][string]$hiredate,
-    [ValidateSet('composecure', 'arculus')][string]$company,
+    [ValidatePattern('^(?:\d{8}|\d{4}\.\d{2}\.\d{2}|)$')] [string]$hiredate,
+    [ValidateSet('composecure', 'arculus')] [string]$company,
     [string]$manager,
 
-    # ── location & phone ────────────────────────────────────
-    [ValidateSet('Pierce', 'Davidson', 'Memorial', 'Apgar', 'Remote')]
-    [string]$office,
-    [ValidatePattern('^\d+$|^(TEMP|N/A|^$)$')]
-    [ValidatePattern('^(\d{4,6}|^$)$')][string]$employeeid = 'N/A',
-    [ValidatePattern('^(\d{4}|^$)$')]
-    [string]$extension,
+    # ── location & phone ──────────────────────────────────
+    [ValidateSet('Pierce', 'Davidson', 'Memorial', 'Apgar', 'Remote')] [string]$office,
+    [ValidatePattern('^(?:\d{4,6}|TEMP|N/A|)$')] [string]$employeeid = 'N/A',
+    [ValidatePattern('^(?:\d{4}|)$')] [string]$extension = '',
 
-    # ── groups & license options ────────────────────────────
+    # ── groups & license options ──────────────────────────
     [string[]]$addgroups,
     [string[]]$addazuregroups,
-    [ValidateSet('composecure', 'arculus')][string]$primarycompany = 'composecure',
+    [ValidateSet('composecure', 'arculus')] [string]$primarycompany = 'composecure',
     [string[]]$license,
 
-    # ── misc ────────────────────────────────────────────────
-    [hashtable]$extra_attributes,
-    [switch]$force
+    # ── misc ──────────────────────────────────────────────
+    [hashtable]$extraattr,
+    [switch]$force,
+    [switch] $v
 )
 
-# ═══════════════════════════════════════════════════════════
-#  CONSTANTS, CLASS-SCOPED VARIABLES & MODULES
-# ═══════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════
+#  CONSTANTS & MODULES (import **before** any AD cmdlets)
+# ═════════════════════════════════════════════════════════
 $DOMAIN = 'COMPOSECURE.LOCAL'
 $TEMPLATE_SAM = 'basicuser'
-$DEFAULT_LOGON_SCRIPT = 'MapScript.cmd'
-$MANAGER_DN = $manager
-$TEMPLATE_USER = Get-ADUser $TEMPLATE_SAM -Server $DOMAIN -Properties * -ErrorAction Stop
-$TEMPLATE_OU = ($TEMPLATE_USER.DistinguishedName -replace '^CN=[^,]+,')
+$DEFAULT_LOGONFILE = 'MapScript.cmd'
 $INTRODUCTIONS = @('howdy, pardner.', 'yippie kye yay, mother dearest.', 'hola, mi amigo.', 'ni hao.', 'que lo que, mama huevos.')
 
-Install-Module -Name AzureAD -Scope CurrentUser
-Import-Module AzureAD -ErrorAction Stop
-Import-Module ActiveDirectory -ErrorAction Stop
-
-$upn = $null
-$proxy_addresses = @()
-$attr = $null
-$new_user = $null
-$validated_ad_groups = @()
-$validated_azure_groups = @()
-
-$req_map = @{
-    username            = "what's the username for the new user? (this is usually in the format 'firstinitial lastname')"
-    givenname           = 'first name?'
-    surname             = 'last name?'
-    jobtitle            = 'job title?'
-    department          = 'department?'
-    extensionAttribute2 = 'hire date? (yyyymmdd)'
-    company             = 'company (composecure | arculus)?'
-    manager             = 'manager (formatted as first initial, last name)?'
-    office              = 'office (Pierce | Davidson | Memorial | Apgar | Remote)?'
-    employeeid          = 'employee id (digits (0-9+) | TEMP | N/A)?'
-    extension           = 'phone extension (4 digits | blank)?'
-    primarycompany      = 'primary company  (composecure | arculus)?'
-    groups              = 'additional ad group(s) (semi-colon or comma separated)?'
-    license             = 'azure license(s) (semi-colon or comma separated)?'
+if (-not (Get-Module ActiveDirectory)) { Import-Module ActiveDirectory -ErrorAction Stop }
+if (-not (Get-Module AzureAD)) {
+    try { Import-Module AzureAD -ErrorAction Stop } catch { Write-Warning 'AzureAD module not available; cloud tasks will be skipped.' }
 }
 
-# ═══════════════════════════════════════════════════════════
+# grab the template once modules are loaded
+$TEMPLATE_USER = Get-ADUser $TEMPLATE_SAM -Server $DOMAIN -Properties * -ErrorAction Stop
+$TEMPLATE_OU = ($TEMPLATE_USER.DistinguishedName -replace '^CN=[^,]+,')
+
+# ═════════════════════════════════════════════════════════
+#  SCRIPT-SCOPED VARIABLES
+# ═════════════════════════════════════════════════════════
+$script:MANAGER_DN = $null
+$script:validated_ad_groups = @()
+$script:validated_azure_groups = @()
+$script:proxy_addresses = @()
+$script:upn = $null
+$script:new_user = $null
+$script:azure_user = $null
+
+# ═════════════════════════════════════════════════════════
 #  FUNCTIONS
-# ═══════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════
+function Show-Walkthrough {
+    $param_map = @{      # prompts for missing params
+        username       = "username (firstinitial + lastname)"
+        givenname      = 'first name'
+        surname        = 'last name'
+        jobtitle       = 'job title'
+        department     = 'department'
+        hiredate       = 'hire date (YYYYMMDD or YYYY.MM.DD)'
+        company        = 'company (composecure|arculus)'
+        manager        = 'manager (username)'
+        office         = 'office (Pierce|Davidson|Memorial|Apgar|Remote)'
+        employeeid     = 'employee id (digits|TEMP|N/A):'
+        extension      = 'phone extension (4 digits or blank)'
+        primarycompany = 'primary company (composecure|arculus)'
+        addgroups      = 'additional AD groups (comma/semicolon separated)'
+        addazuregroups = 'additional Azure AD groups (Intune/Entra)'
+        license        = 'azure license(s) (comma/semicolon separated)'
+    }
 
-function walkthrough {
-    $missing_inputs = $false;
+    $required = @(
+        'username',
+        'givenname',
+        'surname',
+        'jobtitle',
+        'department',
+        'manager',
+        'company',
+        'office'
+    )
+    
+    $missing_inputs = $false
 
-    foreach ($key in $req_map.Keys) {
-        if (-not (Get-Variable $key -ErrorAction SilentlyContinue).Value) {
+    # maps are random, this loop is mostly for prompt order
+    for ($i = 0; $i -lt $required.Count; $i++) {
+        $k = $required[$i]
+
+        if (-not (Get-Variable $k -ErrorAction SilentlyContinue).Value) {
             if (-not $missing_inputs) {
-                
                 $missing_inputs = $true
-                $random_greeting = get-random -InputObject $introductions
-
-                $script:new_user = Get-ADUser -Filter "sAMAccountName -eq '$username'" -ErrorAction SilentlyContinue
-                
-                if ($null -ne $script:new_user) {
-                    Write-Host "$random_greeting looks like you're updating an existing user. only the provided flags will be updated."
-                    return
-                } else {
-                    write-host "`n`n$random_greeting you just ran this script with missing inputs, so i'll walk you through the possible options. :)`n`n"
-                }
+                $greet = (Get-Random -InputObject $INTRODUCTIONS)
+                Write-Host "`n$greet looks like you missed some input(s). i'll walk you through."
             }
+
+            write-host "`nmissing $k.`n" -Foreground Cyan
+            $val = Read-Host "-> $($param_map[$k])"
+
+            if ($val) {
+                Set-Variable -Name $k -Value $val -Scope Script
+                continue
+            }
+        }   
+    }
+    
+    # then we can do the others in whatever order
+    foreach ($k in $param_map.Keys) {
+        if (-not (Get-Variable $k -ErrorAction SilentlyContinue).Value) {
+            
+            write-host "`nmissing $k.`n" -Foreground Cyan
             do {
-                $value = Read-Host "→ $($req_map[$key])"
-                # empty strings are allowed for employeeid / extension, so break anyway
-                if ($key -in 'employeeid', 'extension' -or $value) {
-                    Set-Variable -Name $key -Value $value -Scope Script
+                $val = Read-Host "-> $($param_map[$k])"
+                if ($k -in 'employeeid', 'extension', 'addgroups', 'addazuregroups' -or $val) {
+                    Set-Variable -Name $k -Value $val -Scope Script
                     break
                 }
             } while ($true)
         }
-
-        # re-run validation attributes (throws if bad)
-        $psboundparameters.Keys |
-            Where-Object { $_ -notin 'extra_attributes', 'force' } |
-            ForEach-Object { $null = (Get-Variable $_ -Scope Script).Value }
     }
 }
 
-function validate_manager {
-    try {
-        $script:MANAGER_DN = (Get-ADUser $manager -Server $DOMAIN -ErrorAction Stop).DistinguishedName
-    } catch {
-        if ($null -ne $script:new_user) {
-            return
-        } else {
-            throw "$script:MANAGER_DN not found in AD."
-        }
+function Test-Manager {
+    if ($manager) {
+        try { $script:MANAGER_DN = (Get-ADUser $manager -Server $DOMAIN).DistinguishedName }
+        catch { throw "manager '$manager' not found in AD." }
     }
 }
 
-function build_group_list {
-    # promote the outer variables into this scope
-    $script:validated_ad_groups = @()
-    $script:validated_azure_groups = @()
-    
-    $local_add_groups = ($script:addgroups -join ';').Replace(',', ';').Split(';') | Where-Object { $_ }
-    $local_add_azure_groups = ($script:addazuregroups -join ';').Replace(',', ';').Split(';') | Where-Object { $_ }
-
-    # we're gonna skip adding the 'Domain Users' group here, 
-    # since each user in a domain automatically gets added to it
-    # also keep groups as objects so DisplayName property works
-    $script:validated_ad_groups = Get-ADPrincipalGroupMembership $TEMPLATE_USER |
-        Where-Object SamAccountName -ne 'Domain Users'
-
-    foreach ($g in $local_add_groups) {
-        if ($match = resolve_ad_group_name $g) { $script:validated_ad_groups += $match }
-        else { Write-Warning "No on-prem match for '$g'" }
-    }
-
-    foreach ($g in $local_add_azure_groups) {
-        if ($match = resolve_azure_group_name $g) { $script:validated_azure_groups += $match }
-        else { Write-Warning "No Azure match for '$g'" }
-    }
-}
-
-function prepare_azure_tasks {
-    if ($addazuregroups -or $license) {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Connect-AzureAD -ErrorAction Stop | Out-Null
-        } catch {
-            Write-Warning 'AzureAD module/connection failed; cloud tasks skipped.'
-            $script:license = @()
-            $script:azure_groups = @()
-        }
-    }
-}
-
-function display_confirmation_prompt {
-    if (-not $force) {
-        Write-Host '== GROUPS TO BE APPLIED ==' -Foreground Cyan
-
-        ($script:validated_ad_groups + $azure_groups) |
-            ForEach-Object {
-                # fall back to Name or bare string if DisplayName is empty
-                $label = $_.DisplayName
-                if (-not $label) { $label = $_.Name }
-                # handle plain strings
-                if (-not $label) { $label = $_ }          
-                Write-Host " • $label"
-            } | Sort-Object -Unique
-
-        if ($license) { Write-Host "`nLicense(s): $($license -join ', ')" }
-        if ((Read-Host "`nContinue? (Y/N)").ToUpper() -ne 'Y') { return }
-    }
-}
-
-function generate_proxy_addresses {
-    # we're just gonna add them all in lowercase,
-    # then capitalize the prefix based on the primary company arg
-    $script:proxy_addresses = @(
-        "smtp:$username@composecure.com",
-        "smtp:$username@arculus.co",
-        "smtp:$username@composecure.mail.onmicrosoft.com"
-    )
-    $primary_index = @{'composecure' = 0; 'arculus' = 1 }[$primarycompany]
-    $script:proxy_addresses[$primary_index] = $script:proxy_addresses[$primary_index] -replace '^smtp', 'SMTP'
-}
-
-function validate_standard_attributes {
-    # we should, at bare minimum, make sure that each attribute is somewhat valid 
-    # by 'auto-correcting' empty/null inputs.
-    # could take this further and match specific patterns against each input,
-    # which is slightly better for security.
-    # but that may or may not be necessary? 
-    $company_domain = $(if ($primarycompany -eq 'arculus') { 'arculus.co' } else { 'composecure.com' })
-    $script:attr = @{
-        mail                       = $(if ($script:username -and $company_domain) { "$username@$company_domain" } else { 'NO USERNAME OR COMPANY DOMAIN' }) 
-        proxyAddresses             = $(if ($script:proxyaddresses) { $script:proxyaddresses } else { @() })
-        scriptPath                 = $DEFAULT_LOGON_SCRIPT
-        title                      = $(if ($script:jobtitle) { $script:jobtitle } else { '' })
-        department                 = $(if ($script:department) { $script:department } else { '' })
-        extensionAttribute2        = $(if ($script:hiredate) { $script:hiredate } else { '' })
-        company                    = $(if ($script:company) { $script:company } else { '' })
-        description                = $(if ($script:jobtitle) { $script:jobtitle } else { '' })
-        manager                    = $(if ($script:MANAGER_DN) { $script:MANAGER_DN } else { '' })
-        physicalDeliveryOfficeName = $(if ($script:office) { $script:office } else { '' })
-        employeeID                 = $(if ($script:employeeid) { $script:employeeid } else { '' })
-        telephoneNumber            = $(if ($script:extension) { $script:extension } else { 'N/A' })
-    }
-}
-
-function apply_standard_attributes {
-    write-host "applying standard attributes to $script:username"
-
-    try {
-        $existing = Get-ADUser -Filter "sAMAccountName -eq '$script:username'" -Properties *
-
-        # add any missing proxy addresses
-        $need_proxy = $proxy_addresses | Where-Object { $_ -notin $existing.proxyAddresses }
-        
-        if ($need_proxy) { 
-            write-host "updating proxy addresses..."
-            Set-ADUser $existing -Add @{proxyAddresses = $need_proxy } 
-        }
-
-        # add mail attribute if blank
-        if (-not $existing.mail) {
-            write-host "updating email address..."
-            $company_domain = $(if ($script:primarycompany -eq 'arculus') { 'arculus.co' } else { 'composecure.com' })
-            Set-ADUser $existing -Add @{mail = "$username@$company_domain" }
-        }
-    } catch {
-        Write-Host ($_)
-        write-error -Message "error updating proxy and email addresses."
-    }
-    
-}
-
-function apply_extra_attributes {
-    # aint forget about them extra  A T T R I B U T E S
-    write-host "writing extra attributes to $script:username"
-    if ($null -ne $extraattr) {
-        foreach ($kvp in $extraattr.GetEnumerator()) {
-            try { 
-                # validate it first...
-                Set-ADUser $template_sam -Add @{ $kvp.Key = $kvp.Value } -WhatIf
-
-                # valid!
-                Set-ADUser $template_sam -Add @{ $kvp.Key = $kvp.Value }
-                $script:extraattr[$kvp.Key] = $kvp.Value
-            } catch { 
-                Write-Warning "attribute '$($kvp.Key)' invalid – skipped." 
-            }
-        }
-    }
-}
-
-function apply_upn {
-    write-host "applying User Principal Name (UPN)..."
-    # just wanna make sure that the UPN matches the user's primary company
-    $upn_suffix = if ($primarycompany -eq 'composecure') {
-        'composecure.com'
-    } elseif ($primarycompany -eq 'arculus') {
-        'arculus.co'
-    } else {
-        'composecure.com'
-    }
-    $script:upn = "$username@$upn_suffix"
-}
-
-function resolve_ad_group_name {
-    param([string]$Name)
-    write-host "resolving group '$Name'..."
+function Resolve-ADGroupName ([string]$Name) {
     Get-ADGroup -Filter "SamAccountName -like '*$Name*' -or Name -like '*$Name*'" |
         Sort-Object Name | Select-Object -First 1
 }
 
-function resolve_azure_group_name {
-    param([string]$Name)
-    write-host "resolving azure group '$Name'..."
-    Get-AzureADGroup -Filter "startswith(displayName,'$Name')"
+function Resolve-AzureGroupName ([string]$Name) {
+    try { Get-AzureADGroup -Filter "startswith(displayName,'$Name')" | Select-Object -First 1 } catch { }
 }
 
-function compare_secure {
-    param(
-        [System.Security.SecureString]$a,
-        [System.Security.SecureString]$b
+function Set-GroupList {
+    $localAD = ($addgroups -join ';').Replace(',', ';').Split(';') | Where-Object { $_ }
+    $localAAD = ($addazuregroups -join ';').Replace(',', ';').Split(';') | Where-Object { $_ }
+
+    # start with template's memberships
+    $script:validated_ad_groups = Get-ADGroup -LDAPFilter (
+        "(member:1.2.840.113556.1.4.1941:=$($TEMPLATE_USER.DistinguishedName))"
     )
-    # marshal both to plain text only long enough to compare, then zero the buffers
-    $pa = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($a)
-    $pb = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($b)
-    try {
-        return ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($pa) -eq
-            [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pb))
-    } finally {
-        if ($pa) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pa) }
-        if ($pb) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pb) }
+
+    # validate all the listed groups, local and cloud
+    foreach ($g in $localAD) { if ($r = Resolve-ADGroupName $g) { $script:validated_ad_groups += $r } else { Write-Warning "No on-prem match for '$g'" } }
+    foreach ($g in $localAAD) { if ($r = Resolve-AzureGroupName $g) { $script:validated_azure_groups += $r } else { Write-Warning "No Azure match for '$g'" } }
+}
+
+function Open-AzureAD {
+    if ($addazuregroups -or $license) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Connect-AzureAD -ErrorAction Stop | Out-Null
+        } catch { Write-Warning 'AzureAD connect failed; cloud tasks skipped.'; $script:addazuregroups = @(); $script:license = @() }
     }
 }
 
-function get_confirmed_password {
-    param([string]$username)
+function Set-ProxyAddresses {
+    $script:proxy_addresses = @( "smtp:$username@composecure.com", "smtp:$username@arculus.co", "smtp:$username@composecure.mail.onmicrosoft.com" )
+    $primaryIndex = @{composecure = 0; arculus = 1 }[$primarycompany]
+    $script:proxy_addresses[$primaryIndex] = $script:proxy_addresses[$primaryIndex] -replace '^smtp', 'SMTP'
+}
 
+function Show-Confirmation {
+    if ($force) { return }
+
+    if ($v) {
+        Write-Host '== GROUPS TO BE APPLIED ==' -Foreground Cyan
+        ($script:validated_ad_groups + $script:validated_azure_groups) |
+            Sort-Object -Property Name -Unique |
+            ForEach-Object { Write-Host " - $(if ($_.DisplayName) {$_.DisplayName} else {$_.Name})" }
+    }
+
+    Write-Host "$($script:validated_ad_groups.Count + $script:validated_azure_groups.Count) groups will be added."
+
+    if ($license) { Write-Host "`nLicense(s): $($license -join ', ')" }
+    if ((Read-Host "`nContinue? (Y/N)").ToUpper() -ne 'Y') { write-host 'Cancelled by user.' }
+}
+
+function Set-StandardAttributes {
+    $companyDomain = if ($primarycompany -eq 'arculus') { 'arculus.co' } else { 'composecure.com' }
+    $script:attr = @{
+        mail                       = "$username@$companyDomain"
+        proxyAddresses             = $script:proxy_addresses
+        scriptPath                 = $DEFAULT_LOGONFILE
+        title                      = Capitalize $jobtitle
+        department                 = Capitalize $department
+        extensionAttribute2        = $hiredate
+        company                    = Capitalize $company
+        description                = Capitalize $jobtitle
+        manager                    = $MANAGER_DN
+        physicalDeliveryOfficeName = Capitalize $office
+        employeeID                 = $employeeid
+        telephoneNumber            = $extension
+    }
+}
+
+function Capitalize ([string] $phrase) {
+    [string[]] $word_list = $phrase.Split(" ")
+    [int16] $num_words = $word_list.Count
+
+    if ($word_list.Count -gt 1) {
+        for ($i = 0; $i -lt $num_words; $i++) {
+            [string] $current_word = $word_list[$i].ToLower()
+
+            if (-not ($current_word -eq 'of' -or $current_word -eq 'and')) {
+                $word_list[$i] = CapitalizeWord $current_word
+            }
+
+        }
+    } else {
+        $word_list[0] = CapitalizeWord $word_list[0]
+    }
+    
+    return $word_list -join " "
+
+}
+
+function CapitalizeWord([string] $word) {
+    [string[]] $word_char_array = $word.ToCharArray()
+    $word_char_array[0] = $word_char_array[0].ToUpper()
+    return $word_char_array -join ""
+}
+
+function Compare-Secure ([SecureString]$a, [SecureString]$b) {
+    $pa = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($a)
+    $pb = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($b)
+    try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pa) -eq [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pb) } finally {
+        if ($pa) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pa) }; if ($pb) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pb) }
+    }
+}
+
+function Get-ConfirmedPassword {
     do {
         $p1 = Read-Host "initial password for $username" -AsSecureString
-        $p2 = Read-Host "confirm password" -AsSecureString
-
-        if (-not (compare_secure $p1 $p2)) {
-            write-host "❌ passwords don't match! please try again.`n" -foreground yellow
-            continue
-        }
+        $p2 = Read-Host 'confirm password' -AsSecureString
+        if (-not (Compare-Secure $p1 $p2)) { Write-Host '❌ passwords do not match.`n' -Foreground Yellow; continue }
 
         try {
-            New-ADUser `
-                -SamAccountName          "$username" `
-                -UserPrincipalName       "$upn" `
-                -Name                    "$givenname $surname" `
-                -GivenName               "$givenname" `
-                -Surname                 "$surname" `
-                -DisplayName             "$givenname $surname" `
-                -Path                    "$TEMPLATE_OU" `
-                -AccountPassword         $password `
-                -ChangePasswordAtLogon:  $false `
-                -Enabled                 $true `
-                -WhatIf
-            return $p1 # ✅ good password
+            New-ADUser -Name 'validation' -SamAccountName 'tmp' -AccountPassword $p1 -Enabled:$false -WhatIf
+            return $p1
         } catch {
-            write-warning ($_)
-            write-host "password didn't meet complexity requirements. please try again. (14 chars, 1 upper, 1 lower, 1 number, 1 special char)`n"
+            Write-Warning 'Password fails complexity; try again.'
         }
     } while ($true)
 }
 
-function create_user {
-    try {
-        $script:new_user = Get-ADUser -Filter "SamAccountName -eq '$username'" -Properties *
-    } catch {
-        if ($null -ne $script:new_user) {
-            # most likely error due to already existing, let's switch gears
-            Write-Host "$username already exists – switching to **add-only** mode" -Foreground Cyan
+function Update-User {
+    $script:new_user = Get-ADUser -Filter "SamAccountName -eq '$username'" -Properties * -ErrorAction SilentlyContinue
+    $script:upn = $script:new_user.UserPrincipalName
+    $companyDomain = if ($primarycompany -eq 'arculus') { 'arculus.co' } else { 'composecure.com' }
 
-            if (-not $script:new_user.scriptPath) {
-                Set-ADUser $script:new_user -Add @{scriptPath = $DEFAULT_LOGON_SCRIPT }
-            }
-
-            write-host "updating org info..."
-            # organization info
-            if (-not $script:new_user.title) {
-                Set-ADUser $script:new_user -Add @{title = $jobtitle }
-            }
-
-            if (-not $script:new_user.department) {
-                Set-ADUser $script:new_user -Add @{department = $department }
-            }
-
-            if (-not $script:new_user.company) {
-                Set-ADUser $script:new_user -Add @{company = $company }
-            }
-
-            if (-not $script:new_user.Manager -and $MANAGER_DN) {
-                Set-ADUser $script:new_user -Manager $MANAGER_DN
-            }
-
-            if (-not $script:new_user.physicalDeliveryOfficeName) {
-                Set-ADUser $script:new_user -Add @{physicalDeliveryOfficeName = $office }
-            }
-
-            if (-not $script:new_user.employeeID) {
-                Set-ADUser $script:new_user -Add @{employeeID = $employeeid }
-            }
-
-            if (-not $script:new_user.telephoneNumber) {
-                Set-ADUser $script:new_user -Add @{telephoneNumber = $extension }
-            }
-
-            # add any missing proxy addresses
-            $need_proxy = $proxy_addresses | Where-Object { $_ -notin $script:new_user.proxyAddresses }
-            if ($need_proxy) { 
-                write-host "updating proxy addresses..."
-                Set-ADUser $script:new_user -Add @{proxyAddresses = $need_proxy } 
-            }
-
-            # add mail attribute if blank
-            if (-not $script:new_user.mail) {
-                write-host "updating email address..."
-                $company_domain = $(if ($primarycompany -eq 'arculus') { 'arculus.co' } else { 'composecure.com' })
-                Set-ADUser $script:new_user -Add @{ mail = "$username@$company_domain" }
-            }
-
-            write-host "verifying and updating on-prem groups..."
-            # add any missing on-prem groups
-            $current_groups = Get-ADPrincipalGroupMembership $script:new_user | Select-Object -Expand SamAccountName
-            $script:validated_ad_groups | Where-Object { $_ -notin $current_groups } |
-                ForEach-Object { Add-ADGroupMember -Identity $_ -Members $script:new_user }
-            
-            # only update attributes if some are provided
-            if ($extraattr) {
-                write-host "verifying and updating extra attributes..."
-                validate_standard_attributes
-            }
-
-            $update_password = read-host "do you want to update the password for $username? (y|n)"
-
-            if ($update_password -eq 'y' -or $update_password -eq "yes") {
-                $pw = (get_confirmed_password) 
-                Set-ADUser -AccountPassword $pw
-
-                $change_pw_at_logon = read-host "force $username to change password at logon? (y|n)"
-
-                if ($change_pw_at_logon -eq 'y' -or $change_pw_at_logon -eq "yes") {
-                    Set-ADUser -ChangePasswordAtLogon $true
-                    write-host "$username will be forced to change their password the next time they log on."
+    if ($script:new_user) {
+        Write-Host "$username exists - running **update** mode." -Foreground Cyan
+        # ensure base attributes & logon script
+        foreach ($k in $script:attr.Keys) {
+            if (-not $script:new_user.$k -and $null -ne $($script:attr[$k]) ) { 
+                if ($v) {
+                    write-host "$k : $($script:attr[$k])"
                 }
+                try {
+                    Set-ADUser $script:new_user -Replace @{ $k = $script:attr[$k] } 
+                } catch {}
             }
-
-            write-host "verifying azure groups..."
-            # azure section is already additive, so just continue into it
-            wait_for_azure_sync
-            return
         }
+        if (-not $script:new_user.proxyAddresses) {
+            Set-ADUser $script:new_user -Add @{proxyAddresses = $proxy_addresses }
+        }
+    } else {
+        # create fresh user
+        $secret = Get-ConfirmedPassword
+        $script:upn = "$username@$companyDomain"
+        New-ADUser -SamAccountName $username -UserPrincipalName $script:upn -Name "$givenname $surname" -GivenName $givenname \ 
+        -Surname $surname -DisplayName "$givenname $surname" -Path $TEMPLATE_OU -AccountPassword $secret \ 
+        -ChangePasswordAtLogon:$false -Enabled:$true -OtherAttributes $script:attr
     }
 
-    $company_domain = $(if ($primarycompany -eq 'arculus') { 'arculus.co' } else { 'composecure.com' })
-    write-host "creating user '$username'..."
-    $password = get_confirmed_password -username $username
-
-    # come forth my child
-    New-ADUser `
-        -SamAccountName          "$username" `
-        -UserPrincipalName       "$upn" `
-        -Name                    "$givenname $surname" `
-        -GivenName               "$givenname" `
-        -Surname                 "$surname" `
-        -DisplayName             "$givenname $surname" `
-        -Path                    "$TEMPLATE_OU" `
-        -AccountPassword         $password `
-        -ChangePasswordAtLogon:  $false `
-        -Enabled                 $true `
-        -EmailAddress            $("$username@$company_domain") `
-        -ScriptPath              $DEFAULT_LOGON_SCRIPT `
-        -Title                   $jobtitle `
-        -Department              $department `
-        -Company                 $company `
-        -Manager                 $MANAGER_DN `
-        -Office                  $office `
-        -EmployeeID              $employeeid `
-        -EmployeeNumber          $extension `
-        -Description             $jobtitle       
-
-    
-    apply_standard_attributes
-    apply_extra_attributes
-    add_onprem_groups
-    wait_for_azure_sync
-    add_azure_groups
-    add_azure_license
+    # extras
+    if ($extraattr) {
+        foreach ($kvp in $extraattr.GetEnumerator()) {
+            try { Set-ADUser $script:new_user -Add @{ $kvp.Key = $kvp.Value } }
+            catch { Write-Warning "attribute '$($kvp.Key)' invalid - skipped." }
+        }
+    }
 }
 
-function add_onprem_groups {
-    write-host "adding on-prem AD groups..."
+function Add-OnPremGroups {
+    Write-Host 'Adding on-prem groups...'
     $script:validated_ad_groups | Sort-Object -Unique | ForEach-Object {
         Add-ADGroupMember -Identity $_ -Members $username -ErrorAction SilentlyContinue
     }
 }
 
-function wait_for_azure_sync {
-    $azure_user = $null
-    if ($addazuregroups -or $license) {
-        $timeout = 900   # 15 min
-        $interval = 60    # 1 min
-        $iteration_time = 1
-        $iterations = 1
+function Wait-ForAzureSync {
+    if (-not (Get-Module AzureAD) -or (-not $addazuregroups -and -not $license)) { return }
 
-        Write-Host "waiting for $upn to sync to Azure (15 min max).  press **S** to skip wait and continue."
+    Write-Host "Waiting up to 15 min for Azure sync - tap **S** to skip."
+    $timeout = 900; $interval = 60; $elapsed = 0
+    while ($elapsed -lt $timeout) {
+        if ([Console]::KeyAvailable -and ([Console]::ReadKey($true)).Key -eq 'S') { Write-Warning 'Azure steps skipped by request.'; return }
+        $script:azure_user = Get-AzureADUser -ObjectId $script:upn -ErrorAction SilentlyContinue
+        if ($script:azure_user) { return }
+        Start-Sleep -Seconds 1; $elapsed += $interval
+    }
+    Write-Warning 'Timed out waiting for Azure; skipping cloud tasks.'
+}
 
-        for (; ($interval * $iterations) -lt $timeout; $iterations += 1) {
-
-            # ── non-blocking key poll ───────────────────────────
-            if ([Console]::KeyAvailable) {
-                $key = [Console]::ReadKey($true)
-                if ($key.Key -eq [ConsoleKey]::S) {
-                    Write-Host 'Azure steps skipped by request.'
-                    $script:addazuregroups = @()
-                    $script:license = @()
-                    break
-                }
-            }
-            if ($elapsed -eq $interval) {
-                $elapsed = 0
-                try {
-                    $azure_user = Get-AzureADUser -ObjectId $script:upn -ErrorAction SilentlyContinue
-                } catch {   
-                    write-host "checked in with azure, $username still not available. waiting 1 min. $(($timeout - ($interval * $iterations)) / 60) min(s) left before skipping."
-                }
-            }
-            
-            if ($azure_user) { 
-                add_azure_groups
-                add_azure_license
-                break
-            }
-
-            Start-Sleep -Seconds $iteration_time
-        }
-
-        if (-not $azure_user -and ($addazuregroups -or $license)) {
-            Write-Warning 'user account took too long to sync to azure; cloud tasks skipped.'
-            $addazuregroups = @(); $license = @()
+function Add-AzureGroups {
+    if ($script:azure_user -and $script:validated_azure_groups) {
+        foreach ($g in $script:validated_azure_groups) {
+            Add-AzureADGroupMember -ObjectId $g.ObjectId -RefObjectId $script:azure_user.ObjectId
         }
     }
 }
 
-function add_azure_groups {
-    if ($azure_user -and $addazuregroups) {
-        foreach ($g in $azure_groups) {
-            Add-AzureADGroupMember -ObjectId $g.ObjectId -RefObjectId $azure_user.ObjectId
+function Add-AzureLicense {
+    if (-not ($script:azure_user -and $license)) { return }
+    $skuMap = @{ e3 = 'SPE_E3'; businesspremium = 'SBP' }
+    
+    foreach ($lic in $license) {
+        $sku = Get-AzureADSubscribedSku | Where-Object skuPartNumber -eq $skuMap[$lic]
+         
+        if ($currentSkuIds -contains $sku.SkuId) {
+            if ($v) { Write-Host "$lic already assigned - skipped." }
+            continue
         }
+        
+        if (-not $sku) { Write-Warning "SKU for $lic not found."; continue }
+
+        if ($currentSkuIds -contains $sku.SkuId) {
+            if ($v) { Write-Host "$lic already assigned - skipped." }
+            continue
+        }
+
+        $free = $sku.prepaidunits.enabled - $sku.consumedunits
+        if ($free -le 0) { Write-Warning "No seats left for $lic license."; continue }
+        if ((Read-Host "assign $lic to $script:username? (y/n)").ToUpper() -ne 'Y') { continue }
+        if (-not $script:azure_user.usageLocation) { Set-AzureADUser -ObjectId $script:azure_user.ObjectId -UsageLocation US }
+        $add = New-Object Microsoft.Open.AzureAD.Model.AssignedLicense; $add.SkuId = $sku.SkuId
+        $pack = New-Object Microsoft.Open.AzureAD.Model.AssignedLicenses; $pack.AddLicenses = $add; $pack.RemoveLicenses = @()
+        Set-AzureADUserLicense -ObjectId $script:azure_user.ObjectId -AssignedLicenses $pack
     }
 }
 
-function add_azure_license {
-    # license assignment (seat check & per-license confirmation)
-    if ($azure_user -and $license) {
-        $sku_map = @{ e3 = 'SPE_E3'; businesspremium = 'SBP' }
-
-        foreach ($lic in $license) {
-            $lic_sku = get-azureadsubscribedsku |
-                where-object skupartnumber -eq $sku_map[$lic]
-
-            if (-not $lic_sku) { write-warning "sku for $lic not found."; continue }
-
-            $free = $lic_sku.prepaidunits.enabled - $lic_sku.consumedunits
-            write-host ''
-            write-host "license "$lic" → $free licenses available to assign / $($lic_sku.prepaidunits.enabled) licenses total." -foreground cyan
-            if ($free -le 0) { write-warning "no seats left for $lic."; continue }
-
-            if ((read-host "assign $lic license to $($azure_user.displayname)? (y/n)").trim().toupper() -ne 'Y') { continue }
-
-            # ensure usage location (mandatory for license assignment)
-            if (-not $azure_user.usagelocation) {
-                set-azureaduser -objectid $azure_user.objectid -usagelocation US
-            }
-
-            # build the objects exactly as AzureAD expects
-            $to_add = new-object microsoft.open.azuread.model.assignedlicense
-            $to_add.skuId = $lic_sku.skuId
-
-            $lic_pack = new-object microsoft.open.azuread.model.assignedlicenses
-            $lic_pack.addlicenses = $to_add        # ← single object, **not** array
-            $lic_pack.removelicenses = @()
-
-            set-azureaduserlicense -objectid $azure_user.objectid -assignedlicenses $lic_pack
-        }
-    }
+function MAIN {
+    Show-Walkthrough
+    Test-Manager
+    Set-ProxyAddresses
+    Set-StandardAttributes
+    Open-AzureAD
+    Set-GroupList
+    Show-Confirmation
+    Update-User
+    Add-OnPremGroups
+    Wait-ForAzureSync
+    Add-AzureGroups
+    Add-AzureLicense
+    Write-Host "`n$givenname $surname's account was created/updated successfully! :)`n" -ForegroundColor Green
 }
 
-function PERFORMALL {
-    validate_manager
-    apply_upn
-    prepare_azure_tasks
-    build_group_list
-    generate_proxy_addresses
-    display_confirmation_prompt
-    validate_standard_attributes
-    create_user
-}
+MAIN
 
-walkthrough
-PERFORMALL
-
-
-
-Write-Host "`n✔`tUser $username created and configured! " -Foreground Green
-
-
-# @author   Deron Decamp (ddecamp@composecure.com)
-# @date     6.7.2025
+# @author   Deron Decamp
+# @date     2025-07-23
